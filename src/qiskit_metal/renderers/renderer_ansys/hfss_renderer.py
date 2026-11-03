@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Tuple
@@ -52,6 +54,62 @@ def _is_axis_aligned(x0: float, y0: float, x1: float, y1: float, tol: float = 1e
     """True if the line (x0, y0) -> (x1, y1) runs along x or y."""
     dx, dy = abs(x1 - x0), abs(y1 - y0)
     return min(dx, dy) <= tol * max(dx, dy)
+
+
+def _network_data(sweep, variation: str, formats: list | str):
+    """pyEPR's ``HfssFrequencySweep.get_network_data``, with the design
+    variation named. pyEPR passes an empty key, which AEDT 2025 R2 refuses
+    (COM error -2147024381) once the design has variables, such as the Lj and
+    Cj that ScatteringImpedanceSim sets. The export call and the parsing are
+    otherwise pyEPR's.
+
+    Args:
+        sweep (pyEPR.ansys.HfssFrequencySweep): A solved sweep.
+        variation (str): Design variation key, e.g. "Cj='0fF' Lj='10nH'".
+        formats (list | str): Parameters such as ["S11", "S21"].
+
+    Returns:
+        tuple: The frequencies in Hz, and one complex array per parameter.
+    """
+    if isinstance(formats, str):
+        formats = formats.split(",")
+    formats = [f.upper() for f in formats]
+    by_type = {"S": [], "Y": [], "Z": []}
+    for f in formats:
+        by_type[f[0]].append((int(f[1]), int(f[2])))
+    curves = [None] * len(formats)
+    freqs = None
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        for data_type, pairs in by_type.items():
+            if not pairs:
+                continue
+            path = os.path.join(folder, f"{data_type}.tab")
+            sweep.parent._solutions.ExportNetworkData(
+                variation,
+                sweep.solution_name,
+                2,  # tab-separated
+                path,
+                ["all"],
+                False,
+                0,
+                data_type,
+                -1,
+                1,  # real / imaginary
+                15,
+            )
+            with open(path) as f:
+                f.readline()
+                columns = f.readline().split()
+            array = np.loadtxt(path, skiprows=2, ndmin=2)
+            if freqs is None:
+                freqs = array[:, 0]
+            for i, j in pairs:
+                re = columns.index(f"{data_type}[{i},{j}]_Re")
+                im = columns.index(f"{data_type}[{i},{j}]_Im")
+                curves[formats.index(f"{data_type}{i}{j}")] = (
+                    array[:, re] + 1j * array[:, im]
+                )
+    return freqs, curves
 
 
 class QHFSSRenderer(QAnsysRenderer):
@@ -677,7 +735,7 @@ class QHFSSRenderer(QAnsysRenderer):
 
         if self.pinfo:
             if self.pinfo.design:
-                return self.pinfo.design.create_dm_setup(
+                setup = self.pinfo.design.create_dm_setup(
                     freq_ghz=freq_ghz,
                     name=name,
                     max_delta_s=max_delta_s,
@@ -687,6 +745,26 @@ class QHFSSRenderer(QAnsysRenderer):
                     pct_refinement=pct_refinement,
                     basis_order=basis_order,
                 )
+                if self._converges_on_energy(setup):
+                    self.logger.warning(
+                        f"Setup '{setup.name}' was added before the design has ports: "
+                        f"Ansys replaces max_delta_s={max_delta_s} with its default Max "
+                        "Delta S when the ports are drawn. Add the setup after "
+                        "render_design(), or set max_delta_s then with "
+                        "edit_drivenmodal_setup()."
+                    )
+                return setup
+
+    @staticmethod
+    def _converges_on_energy(setup) -> bool:
+        """True while a driven setup converges on Delta Energy, as Ansys does
+        until the design has ports. Its property window then shows "Delta
+        Energy"; with ports, "Delta S" (AEDT 2025 R2)."""
+        try:
+            names = setup.prop_holder.GetProperties(setup.prop_tab, setup.prop_server)
+        except Exception:  # noqa: BLE001 -- other AEDT versions: no warning
+            return False
+        return "Delta Energy" in names and "Delta S" not in names
 
     def add_eigenmode_design(self, name: str, connect: bool = True):
         """
@@ -907,18 +985,20 @@ class QHFSSRenderer(QAnsysRenderer):
             setup_args (Dict): a Dict with possible keys/values.
 
         **setup_args** dict contents:
-            * name (str, optional): Name of eigenmode setup. Defaults to "Setup".
-            * freq_ghz (int, optional): Minimum frequency in GHz. Defaults to 1.
-            * max_passes (int, optional): Maximum number of passes. Defaults to 10.
-            * pct_refinement (int, optional): Percent refinement. Defaults to 30.
-            * basis_order (int, optional): Basis order. Defaults to -1 (1 is "Mixed Order").
-
-            Note, that these three are currently NOT implemented:
-            Ansys API named EditSetup not documented for HFSS, and
-            self.pinfo.setup does not have all the property variables used for Setup.
+            * name (str, optional): Name of driven modal setup. Defaults to "Setup".
+            * freq_ghz (float, optional): Solution frequency in GHz. Defaults to 5.
             * max_delta_s (float, optional): Absolute value of maximum difference in scattering parameter S. Defaults to 0.1.
+            * max_passes (int, optional): Maximum number of passes. Defaults to 10.
             * min_passes (int, optional): Minimum number of passes. Defaults to 1.
             * min_converged (int, optional): Minimum number of converged passes. Defaults to 1.
+            * pct_refinement (int, optional): Percent refinement. Defaults to 30.
+            * basis_order (int, optional): Basis order: 1 is "First Order", -1 is "Mixed Order".
+
+            Until the design has ports, Ansys converges a driven setup on Delta
+            Energy: it ignores max_delta_s, and it sets Max Delta S to its default
+            when the ports are drawn. Set max_delta_s after render_design().
+
+            The setup edited is the one with this name in the active design.
         """
 
         if self.pinfo:
@@ -933,19 +1013,42 @@ class QHFSSRenderer(QAnsysRenderer):
                                 f"setup_args was not used to update the active Setup."
                             )
                             return
+                        # Not self.pinfo.setup: activate_ansys_design() of an existing
+                        # design leaves it on the previous design's setup.
+                        try:
+                            setup = self.pinfo.design.get_setup(setup_args.name)
+                        except EnvironmentError as error:
+                            self.logger.warning(f"{error}. The Setup not updated.")
+                            return
 
+                        # Fields the setup's property window does not show: EditSetup.
+                        fields = []
                         for key, value in setup_args.items():
                             if key == "name":
                                 continue  # Checked for above.
                             if key == "freq_ghz":
-                                if not isinstance(value, float):
+                                # An int is fine too: default_setup uses freq_ghz=5.
+                                if isinstance(value, bool) or not isinstance(
+                                    value, (int, float)
+                                ):
                                     self.logger.warning(
-                                        "The value for freq_ghz should be an float. "
+                                        "The value for freq_ghz should be a number. "
                                         f"The present value is {value}."
                                     )
                                 else:
-                                    self.pinfo.setup.solution_freq = f"{value}GHz"
-                                    continue
+                                    setup.solution_freq = f"{value}GHz"
+                                continue
+                            if key == "max_delta_s":
+                                if isinstance(value, bool) or not isinstance(
+                                    value, (int, float)
+                                ):
+                                    self.logger.warning(
+                                        "The value for max_delta_s should be a number. "
+                                        f"The present value is {value}."
+                                    )
+                                else:
+                                    fields += ["MaxDeltaS:=", float(value)]
+                                continue
                             if key == "max_passes":
                                 if not isinstance(value, int):
                                     self.logger.warning(
@@ -953,8 +1056,21 @@ class QHFSSRenderer(QAnsysRenderer):
                                         f"The present value is {value}."
                                     )
                                 else:
-                                    self.pinfo.setup.passes = value
-                                    continue
+                                    setup.passes = value
+                                continue
+                            if key in ("min_passes", "min_converged"):
+                                if isinstance(value, bool) or not isinstance(
+                                    value, int
+                                ):
+                                    self.logger.warning(
+                                        f"The value for {key} should be an int. "
+                                        f"The present value is {value}."
+                                    )
+                                elif key == "min_passes":
+                                    fields += ["MinimumPasses:=", value]
+                                else:
+                                    fields += ["MinimumConvergedPasses:=", value]
+                                continue
                             if key == "pct_refinement":
                                 if not isinstance(value, int):
                                     self.logger.warning(
@@ -962,21 +1078,40 @@ class QHFSSRenderer(QAnsysRenderer):
                                         f"The present value is {value}."
                                     )
                                 else:
-                                    self.pinfo.setup.pct_refinement = value
-                                    continue
+                                    setup.pct_refinement = value
+                                continue
                             if key == "basis_order":
-                                if not isinstance(value, int):
+                                if isinstance(value, bool) or not isinstance(
+                                    value, int
+                                ):
                                     self.logger.warning(
                                         "The value for basis_order should be an int. "
                                         f"The present value is {value}."
                                     )
                                 else:
-                                    self.pinfo.setup.basis_order = value
-                                    continue
+                                    # The property window wants the order's name
+                                    # ("Mixed Order"); a number there is a COM error.
+                                    fields += ["BasisOrder:=", value]
+                                continue
 
                             self.design.logger.warning(
                                 f"In setup_args, key={key}, value={value} is not in pinfo.setup, "
                                 "the key/value pair from setup_args not added to Setup in Ansys."
+                            )
+
+                        if fields:
+                            if "MaxDeltaS:=" in fields and self._converges_on_energy(
+                                setup
+                            ):
+                                self.logger.warning(
+                                    f"Setup '{setup.name}' has no ports to converge on yet: "
+                                    "Ansys ignores max_delta_s until the design has ports, "
+                                    "and then sets Max Delta S to its default (0.02 in "
+                                    "AEDT 2025 R2). Set max_delta_s after render_design()."
+                                )
+                            # EditSetup keeps the fields it is not given.
+                            setup._setup_module.EditSetup(
+                                setup.name, ["NAME:" + setup.name, *fields]
                             )
 
                     else:
@@ -1124,16 +1259,64 @@ class QHFSSRenderer(QAnsysRenderer):
             self.current_sweep = sweep
 
     def get_params(self, param_name: list | None = None):
-        """Get one or more parameters (S, Y, or Z) as a function of frequency.
+        """Get one or more parameters (S, Y, or Z) as a function of frequency,
+        from the sweep last run with analyze_sweep(), for the design's current
+        (nominal) variation.
 
         Args:
             param_name (Optional[list], optional): Parameters to obtain. Defaults to None.
+
+        Raises:
+            ValueError: No parameters were given.
+            RuntimeError: No sweep was analyzed in this session, the connection
+                to Ansys was closed, the sweep has no solution for the current
+                variation, or Ansys failed to export it.
         """
-        if self.current_sweep:
-            freqs, Pcurves = self.current_sweep.get_network_data(param_name)
-            Pparams = pd.DataFrame(
-                Pcurves, columns=freqs / 1e9, index=param_name
-            ).transpose()
+        if not param_name:
+            raise ValueError("Give the parameters to read, e.g. ['S11', 'S21'].")
+        sweep = self.current_sweep
+        if not sweep:
+            raise RuntimeError(
+                "No frequency sweep to read. Run analyze_sweep(sweep_name, "
+                "setup_name) first; ScatteringImpedanceSim.run_sim() does this."
+            )
+        solutions = sweep.parent._solutions
+        if solutions is None:
+            # pyEPR's disconnect() releases every COM object it created.
+            raise RuntimeError(
+                f"The connection to Ansys used by sweep '{sweep.solution_name}' "
+                "was closed (disconnect_ansys() or close()). Reconnect and run "
+                "analyze_sweep() again."
+            )
+        try:
+            variation = sweep.parent.parent.get_nominal_variation()
+        except Exception as e:
+            raise RuntimeError(
+                "Could not read the design variation of sweep "
+                f"'{sweep.solution_name}' from Ansys: {e}"
+            ) from e
+        try:
+            # Empty for a sweep that is not solved, or whose design changed after.
+            solved = list(solutions.ListVariations(sweep.solution_name))
+        except Exception:  # noqa: BLE001 -- a pre-check only; the export reports errors
+            solved = None
+        if solved is not None and variation not in solved:
+            raise RuntimeError(
+                f"The sweep '{sweep.solution_name}' has no solution for the design's "
+                f"current variation ({variation!r}; solved: {solved}). Run "
+                "analyze_sweep() again: a change to the design after solving "
+                "discards the solution."
+            )
+        try:
+            freqs, Pcurves = _network_data(sweep, variation, param_name)
+        except Exception as e:
+            raise RuntimeError(
+                "Ansys could not export the network data of sweep "
+                f"'{sweep.solution_name}' for variation {variation!r}: {e}"
+            ) from e
+        Pparams = pd.DataFrame(
+            Pcurves, columns=freqs / 1e9, index=param_name
+        ).transpose()
         return freqs, Pcurves, Pparams
 
     # yapf: disable
@@ -1175,16 +1358,15 @@ class QHFSSRenderer(QAnsysRenderer):
             param_name (Optional[list], optional): Parameters to plot. Defaults to None.
         """
         freqs, Pcurves, Pparams = self.get_params(param_name)
-        if Pparams is not None:
-            fig, axs = plt.subplots(1, 2, figsize=(10, 6))
-            Pparams.apply(lambda x: 20 * np.log10(np.abs(x))).plot(ax=axs[0])
-            axs[0].set_xlabel('Frequency (GHz)')
-            axs[0].set_ylabel('Amplitude (dB)')
-            Pparams.apply(lambda x: np.angle(x)).plot(ax=axs[1])
-            axs[1].set_xlabel('Frequency (GHz)')
-            axs[1].set_ylabel('Phase (rad.)')
-            for ax in axs:
-                ax.autoscale()
+        fig, axs = plt.subplots(1, 2, figsize=(10, 6))
+        Pparams.apply(lambda x: 20 * np.log10(np.abs(x))).plot(ax=axs[0])
+        axs[0].set_xlabel('Frequency (GHz)')
+        axs[0].set_ylabel('Amplitude (dB)')
+        Pparams.apply(lambda x: np.angle(x)).plot(ax=axs[1])
+        axs[1].set_xlabel('Frequency (GHz)')
+        axs[1].set_ylabel('Phase (rad.)')
+        for ax in axs:
+            ax.autoscale()
         return Pparams, fig
 
     def distributed_analysis(self):
